@@ -1,0 +1,177 @@
+---
+title: "Ageing of clutch size"
+author: "Eve Cooper"
+date: "September 19, 2019"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Purpose
+
+This guide demonstrates a method for investigating whole-life ageing patterns in a population using longitudinal data collected from individuals of known age. Ageing trajectories may not follow simple parametric functions and so need to be modelled using methodology that does not constrict their shape to assume such a function. However, in order to make quantitative comparisons of ageing between traits,populations, or species it is necessary to define which features of ageing to quantify and do so using standardized units of scale. We therefore take a two step approach:  
+
+1. Model the effect of age on the trait of interest non-parametrically using generalized additive mixed-models (GAMMs).
+2. Using standardized estimates for each age from the GAMM, run a break-point analysis and quantify rates and durations of early-life improvements and late-life declines.
+
+We illustrate how to control for the effects of selective (dis)appearance, variability between individuals, variability in environment, and other factors that may confound the true ageing pattern at the population-level. 
+
+This guide uses the example of clutch size (a proxy for reproductive investment) in a wild population of Superb fairy-wrens. 
+
+#Packages
+Load the neccessary packages and their dependencies.
+```{r, packages, echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE}
+library(mgcv)
+library(segmented)
+library(dplyr)
+```
+
+#Dataset
+We will use data collected over between 1987 - 2016 on a wild population of fairy-wrens living in the Australian National Botanic Gardens. Each ID refers to a unique female. Females attempt to breed each year from age 1 and can have multiple clutches in a year. Each row in the dataframe refers to a single clutch. 
+
+```{r, data}
+clutch.dat <- read.table("data/clutchSize.txt",header=TRUE)
+```
+
+##Generalized additive mixed model
+Using the package mgcv, we will run a GAMM of clutch size (number of eggs) in response to the non-parametric effect of age. s() denotes non-parametric terms (splines), while terms without this notation are parametric (analogous to as they'd be fitted in a glmm). Because we have prior knowledge that the fairy-wrens tend to lay larger clutches in the middle of the breeding season, we include a spline of the date when clutch was laid (julianDate) to control for this. Lifespan is fitted as a parametric effect in order to control for selective disappearance. Note that for a given population effects of selective (dis)appearance should not be assumed to be linear. Fitting lifespan as a spline to check the shape of the relationship was previously done. EDF~1, and so a linear relationship was adequate in this case to control for potential selective disappearance in the population. Individual ID and year are fitted as random effects in order to control for non-indpendence between datapoints (multiple datapoints per ID), and environmental variability between years. Estimation method is set to REML. Family is set to quasipoisson to account for under dispersion in clutch size data (clutch size ranges from 2-4). K values are described further below.
+
+```{r, run GAMM}
+#model takes about 10 - 20 minutes to run
+#instead of running, just load the previously run model below
+#clutch.gam<-gam(eggs~s(age,k=9)+s(julianDate)+lifespan+s(ID,bs="re")+s(year,bs="re"),data=clutch.dat,method="REML",family=quasipoisson(link="log"))
+#saveRDS(clutch.gam,"clutch.gam.rds"
+
+#load the previously run model
+clutch.gam <- readRDS("clutch.gam.rds")
+```
+
+
+##GAMM model review
+
+**gam.check()**
+
+This gives the model convergence and some diagnostic plots. Basis dimension checking results for each spline are also given. In this specific case, significant p-values for the term s(age) are not of concern since the maximum k specified for age is also the maximum degrees of freedom (9). For other spline term(s) with a k-index close to 1, models should be rerun with higher k values for those splines. If the residuals in the updated model are different, it's preferable to keep the more complex model. In this specific case, higher k values did not change the model so the default k values were kept. See '?choose.k' for more information.
+
+```{r, GAMM check}
+#check convergence of the model, and check that basis dimension (k) is adequate
+gam.check(clutch.gam)
+```
+
+**concurvity()**
+
+The GAMM equivelent to checking for colinearity in a GLMM. We can see that concurvities between fixed effects here are very small.
+```{r, concurvity}
+concurvity(clutch.gam,full=FALSE)
+```
+
+**model results**
+
+Finally, we can take a look at results of our model with the summary() function. We can see that both age and Julian date of incubation have significant, non-linear effects on clutch size. Lifespan does not have a significant effect suggesting lifespan is not correlated with larger or smaller clutches overall. 
+
+```{r, GAMM results}
+summary(clutch.gam)
+```
+
+
+**gam.vcomp()**
+
+This function gives the variance (standard deviation) for each term. For the random effects, the std.dev suggests how much of the residual variance they explain. We can see here that differences between individuals (ID) explains a larger amount of variation in clutch size than environmental differences between years (year).
+```{r}
+gam.vcomp(clutch.gam)
+```
+
+**plot results**
+
+We can plot the results of our GAMM to visualize the ageing tragectory of clutch size.
+```{r, GAMM plot,echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE}
+plot(clutch.gam,seWithMean=2,shade=TRUE,trans=exp,shift=coef(clutch.gam)[1],select=1,main="Female Clutch Size",
+     ylab="Eggs",xlab="Age",ylim=c(2.8,3.4))
+```
+
+#Quantify ageing trajectories
+
+We can see from the GAMM graph that it appears that clutch size increases in early ages, plateaus, and then declines at late ages. However, if we want to quantify the rates of these increases and decreases, a second step is neccessary. Now we will:
+
+- extract age-specific estimates of clutch size for each age from the GAMM
+- standardize these estimates by z-transforming them. This allows direct comparison of ageing between traits, populations, or species
+- run a simple linear model using these standardized estimates
+- use the package '?segmented' to test for a breakpoint in the linear model
+
+This process allows for us to identify and quantify the rate and significance any early-life improvement (maturation) as well as late-life decline (senescence). If late-life declines are significant, breakpoint analysis indicates the age of onset of senescence.
+
+First we extract the estimates from the GAMM and standardize them.
+```{r, estimates}
+#pull estimates
+pred.clutch<-data.frame(x=predict.gam(clutch.gam,type="link",se.fit=TRUE))
+#create a new clutch data table excluding individuals without lifespan (since they're excluded from model)
+clutch.datS<-clutch.dat %>%
+  filter(!is.na(lifespan))
+#add age column
+pred.clutch$age <- clutch.datS$age
+#summarize data for each age class
+sum.clutch <-pred.clutch %>%
+  group_by(age) %>%
+  summarize(x=mean(x.fit),se=mean(x.se.fit))
+#z-transform (prediction - mean prediction divided by range of predictions)
+#add to the prediction table
+pred.clutch<-sum.clutch %>%
+  mutate(xz=(x-mean(sum.clutch$x))/(max(sum.clutch$x)-min(sum.clutch$x)))
+```
+
+Run a linear model using these standardized estimates. Weight the model by the inverse of the standard error. This accounts for declining confidence with decreasing sample size (sample size decreases with age).
+```{r}
+summary(lm.clutch<-lm(xz~age,weights = 1/se, data=pred.clutch))
+```
+
+From the linear model results, we can see that there is no effect of age on clutch size when we constrain the relationship to a single linear slope.
+
+Now, we can test if there is a significant breakpoint in the model using a Davies test. This tests for a non-zero difference in slopes if the linear model were broken into two linear models, at multiple points in the model. Essentially it is testing if the relationship between age and clutch size might be better explained by two segmented/broken linear models, rather than one. See '?davies.test' for details.
+```{r, davies test}
+davies.test(lm.clutch,seg.Z =~age)
+```
+
+P-value for the davies test indicates a 2% that there is no difference between slopes of a segmented model. So that provides some indication that two seperate split linear models might better describe this ageing pattern than one. Since in our study we conservatively set our threshold of significant at 0.01 due to the large number of statistical tests we did, we stopped analysis here and used the linear model for clutch size in our results.
+
+However, for the purpose of this demonstration, we will show how to segment the linear model. The function segmented() implements a bootstrap restarting algorithm to find the breakpoint in the linear model that with result in the largest difference in the slopes of the resulting two models. See '?segmented' for details.
+
+```{r}
+summary(seg.clutch<-segmented(lm.clutch))
+```
+
+The summary function tells us the breakpoint estimated by the function (3.6). Note that the estimate of 'U1.age' is not the slope of age in later life, it's the difference in the slope of age between early and late life.
+
+To find the slopes of the two regressions we use slope().
+
+```{r}
+slope(seg.clutch)
+```
+
+Okay so what are results are telling us is that there is a non-significant trend of improvement (increased clutch size) in early life up until age 3.6, followed by significant senescent declines in clutch size after that age.This is different to the results reported in our study since we used a significance threshold of 0.01 rather than 0.05.
+
+A graph will help to illustrate what this pattern looks like.
+
+```{r, segmented plot, echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE}
+plot.segmented(seg.clutch,conf.level=0.95,shade=TRUE,xlab="",ylab="")
+title(main="Clutch Size")
+axis(1,at=c(1:9))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
